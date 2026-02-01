@@ -225,3 +225,9 @@ When implementing kernels using Destination Passing Style (DPS), ensure you spec
 ### CUDA Kernel Bindings
 
 For CUDA kernel implementations, we recommend using [TVM FFI](https://tvm.apache.org/ffi/) for Python bindings. The `flashinfer_bench.agents` module provides TVM FFI agent instruction prompts to assist with development.
+
+cd /workspace/flashinfer-bench-starter-kit && export FIB_DATASET_PATH=/workspace/flashinfer-bench-starter-kit/flashinfer-trace && .venv/bin/python scripts/run_local.py
+
+
+
+cd /workspace/flashinfer-bench-starter-kit && export FIB_DATASET_PATH=/workspace/flashinfer-bench-starter-kit/flashinfer-trace && .venv/bin/python scripts/run_quick.py

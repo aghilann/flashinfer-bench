@@ -1,8 +1,23 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
+name = "cutile-moe"               # Solution name
+definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "team-name"              # Team/author name
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "python"               # python | triton | cuda
+entry_point = "kernel.py::run"    # file_path::function_name
+source_dir = "cutile"             # cutile | torch | triton | cuda
+
+# ========================================
+# Previous configurations (commented out):
+# ========================================
+#
+# [solution]
+# name = "torch-baseline"
+# definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
+# author = "team-name"
+#
+# [build]
+# language = "python"
+# entry_point = "kernel.py::run"
+# source_dir = "torch"

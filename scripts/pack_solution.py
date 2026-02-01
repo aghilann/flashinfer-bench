@@ -41,11 +41,15 @@ def pack_solution(output_path: Path = None) -> Path:
     language = build_config["language"]
     entry_point = build_config["entry_point"]
 
-    # Determine source directory based on language
-    if language == "triton":
+    # Determine source directory - use explicit source_dir if provided, else derive from language
+    if "source_dir" in build_config:
+        source_dir = PROJECT_ROOT / "solution" / build_config["source_dir"]
+    elif language == "triton":
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
+    elif language == "python":
+        source_dir = PROJECT_ROOT / "solution" / "torch"
     else:
         raise ValueError(f"Unsupported language: {language}")
 
