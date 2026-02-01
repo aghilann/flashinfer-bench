@@ -4,10 +4,11 @@
 """
 MoE Kernel for FlashInfer Competition - DeepSeek-V3 MoE Layer.
 
-VERSION: v3 - CuTile Optimization with Autotuning:
-1. Optimized silu_and_mul kernel from TileGym
-2. Autotuned Group GEMM for batching expert matrix multiplications
-3. Vectorized token sorting
+OPTIMIZED FOR SMALL SEQUENCE LENGTHS (1-100 tokens):
+- All experts use CuTile GEMM (no cuBLAS fallback)
+- Smaller tile sizes for better occupancy on small batches
+- Aggressive autotuning for small M dimensions
+- Batched SwiGLU for reduced kernel launch overhead
 """
 
 from __future__ import annotations
@@ -18,14 +19,14 @@ import functools
 import threading
 import logging
 from contextlib import contextmanager
-from math import ceil
+from typing import Tuple, Any, Iterable, Callable, Sequence
 from types import SimpleNamespace
-from typing import Tuple, List, Any, Iterable, Callable, Sequence
-from cuda.tile._numeric_semantics import RoundingMode as RMd
 from cuda.tile._exception import TileCompilerTimeoutError, TileCompilerExecutionError
 from cuda.tile._cext import default_tile_context
 
 logger = logging.getLogger(__name__)
+
+ConstInt = ct.Constant[int]
 
 # ============================================================================
 # Autotuner (from cuda.tile_experimental)
@@ -111,8 +112,8 @@ def compiler_timeout(timeout_sec: int):
         default_tile_context.config.compiler_timeout_sec = old_timeout
 
 
-def _reservoir_sample(iterable: Iterable[Any], k: int, *, rng: random.Random, max_items: int) -> list[Any]:
-    reservoir: list[Any] = []
+def _reservoir_sample(iterable: Iterable[Any], k: int, *, rng: random.Random, max_items: int):
+    reservoir = []
     n_seen = 0
     for item in iterable:
         n_seen += 1
@@ -163,7 +164,7 @@ def autotune_launch(stream, grid_fn, kernel,
         else:
             arg_key = key
 
-        tuning_entries: list[tuple[Any, float]] = []
+        tuning_entries = []
         cache_hit = False
 
         if not force_retune and arg_key in per_kernel:
@@ -220,22 +221,6 @@ BLOCK = 128  # FP8 block scale block size
 TOP_K = 8
 N_GROUP = 8
 TOPK_GROUP = 4
-
-ConstInt = ct.Constant[int]
-ConstBool = ct.Constant[bool]
-
-
-def next_power_of_2(n):
-    """Return the next power of 2 >= n."""
-    if n <= 0:
-        return 1
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    return n + 1
 
 
 # ============================================================================
@@ -297,12 +282,137 @@ def deepseek_routing(
 
 
 # ============================================================================
+# CuTile GEMM Kernel with Autotuning - OPTIMIZED FOR SMALL M
+# ============================================================================
+
+@ct.kernel
+def small_gemm_kernel(
+    A_ptr,          # [M, K]
+    B_ptr,          # [N, K] (transposed, so we compute A @ B.T)
+    C_ptr,          # [M, N]
+    M: int,
+    N: ConstInt,
+    K: ConstInt,
+    TILE_M: ConstInt,
+    TILE_N: ConstInt,
+    TILE_K: ConstInt,
+):
+    """GEMM kernel optimized for small M: C = A @ B.T"""
+    bid = ct.bid(0)
+    num_n_tiles = ct.cdiv(N, TILE_N)
+    bid_m = bid // num_n_tiles
+    bid_n = bid % num_n_tiles
+    
+    acc = ct.zeros((TILE_M, TILE_N), dtype=ct.float32)
+    num_k_tiles = ct.cdiv(K, TILE_K)
+    
+    for k in range(num_k_tiles):
+        ta = ct.load(A_ptr, index=(bid_m, k), shape=(TILE_M, TILE_K), padding_mode=ct.PaddingMode.ZERO)
+        tb = ct.load(B_ptr, index=(bid_n, k), shape=(TILE_N, TILE_K), padding_mode=ct.PaddingMode.ZERO)
+        tb = ct.transpose(tb)
+        ta = ct.astype(ta, ct.tfloat32)
+        tb = ct.astype(tb, ct.tfloat32)
+        acc = ct.mma(ta, tb, acc)
+    
+    acc = ct.astype(acc, C_ptr.dtype)
+    ct.store(C_ptr, index=(bid_m, bid_n), tile=acc)
+
+
+def _small_gemm_autotune_configs():
+    """Autotune configurations for small M GEMM - smaller tiles for better occupancy."""
+    gpu_capability = torch.cuda.get_device_capability()
+    if gpu_capability in [(12, 0), (12, 1)]:
+        # sm120, sm121 - smaller tiles for small batches
+        yield SimpleNamespace(TILE_M=16, TILE_N=64, TILE_K=64, num_ctas=1, occupancy=4)
+        yield SimpleNamespace(TILE_M=32, TILE_N=64, TILE_K=64, num_ctas=1, occupancy=4)
+        yield SimpleNamespace(TILE_M=16, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=2)
+        yield SimpleNamespace(TILE_M=32, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=2)
+        yield SimpleNamespace(TILE_M=64, TILE_N=64, TILE_K=64, num_ctas=1, occupancy=2)
+    else:
+        # Blackwell - smaller tiles for small batches
+        yield SimpleNamespace(TILE_M=16, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=4)
+        yield SimpleNamespace(TILE_M=32, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=2)
+        yield SimpleNamespace(TILE_M=32, TILE_N=256, TILE_K=64, num_ctas=1, occupancy=2)
+        yield SimpleNamespace(TILE_M=64, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=2)
+        yield SimpleNamespace(TILE_M=64, TILE_N=256, TILE_K=64, num_ctas=1, occupancy=1)
+
+
+def cutile_small_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """CuTile GEMM optimized for small M: C = A @ B.T"""
+    M, K = A.shape
+    N = B.shape[0]
+    C = torch.empty((M, N), dtype=torch.float32, device=A.device)
+    
+    stream = torch.cuda.current_stream()
+    A_cont = A.contiguous()
+    B_cont = B.contiguous()
+    
+    autotune_launch(
+        stream,
+        grid_fn=lambda cfg: (((M + cfg.TILE_M - 1) // cfg.TILE_M) * ((N + cfg.TILE_N - 1) // cfg.TILE_N),),
+        kernel=small_gemm_kernel,
+        args_fn=lambda cfg: (A_cont, B_cont, C, M, N, K, cfg.TILE_M, cfg.TILE_N, cfg.TILE_K),
+        hints_fn=lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
+        search_space=_small_gemm_autotune_configs,
+    )
+    return C
+
+
+# ============================================================================
+# CuTile Fused SwiGLU Kernel
+# ============================================================================
+
+@ct.kernel
+def fused_swiglu_kernel(
+    G1_ptr,          # [M, 2*I] - GEMM1 output
+    C_ptr,           # [M, I] - SwiGLU output
+    I: ConstInt,     # intermediate_size
+    TILE_SIZE: ConstInt,
+):
+    """Fused SwiGLU: C = silu(G1[:, I:]) * G1[:, :I]"""
+    bid = ct.bid(0)
+    
+    # Load both halves in one kernel
+    x1 = ct.load(G1_ptr, index=(bid, 0), shape=(1, TILE_SIZE), padding_mode=ct.PaddingMode.ZERO)
+    x2 = ct.load(G1_ptr, index=(bid, 1), shape=(1, TILE_SIZE), padding_mode=ct.PaddingMode.ZERO)
+    
+    x1_f32 = ct.astype(x1, ct.float32)
+    x2_f32 = ct.astype(x2, ct.float32)
+    
+    # SiLU(x2) = x2 * sigmoid(x2)
+    sigmoid_x2 = 1.0 / (1.0 + ct.exp(-x2_f32))
+    silu_x2 = x2_f32 * sigmoid_x2
+    
+    # Result = silu(x2) * x1
+    result = silu_x2 * x1_f32
+    result = ct.astype(result, C_ptr.dtype)
+    
+    ct.store(C_ptr, index=(bid, 0), tile=result)
+
+
+def cutile_swiglu(G1: torch.Tensor, I: int) -> torch.Tensor:
+    """CuTile fused SwiGLU: silu(G1[:, I:]) * G1[:, :I]"""
+    M = G1.shape[0]
+    if M == 0:
+        return torch.empty((0, I), dtype=G1.dtype, device=G1.device)
+    C = torch.empty((M, I), dtype=G1.dtype, device=G1.device)
+    
+    ct.launch(
+        torch.cuda.current_stream(),
+        (M,),
+        fused_swiglu_kernel,
+        (G1.contiguous(), C, I, I),
+    )
+    return C
+
+
+# ============================================================================
 # Token Sorting (Vectorized)
 # ============================================================================
 
 def sort_tokens_by_expert(
-    topk_idx: torch.Tensor,
-    weights: torch.Tensor,
+    topk_idx: torch.Tensor,     # [T, TOP_K]
+    weights: torch.Tensor,      # [T, E_global]
     E_local: int,
     local_expert_offset: int,
     E_global: int,
@@ -346,187 +456,7 @@ def sort_tokens_by_expert(
 
 
 # ============================================================================
-# CuTile SiLU and Mul Kernel (from TileGym silu_and_mul.py - OPTIMIZED)
-# ============================================================================
-
-@ct.kernel
-def silu_and_mul_kernel_row_wise(
-    input,
-    output,
-    TILE_SIZE: ConstInt,
-    hidden_size: ConstInt,
-):
-    """Optimized fused SiLU and Mul: silu(input[:, hidden:]) * input[:, :hidden]"""
-    bid = ct.bid(0)
-    offsets = ct.arange(TILE_SIZE, dtype=torch.int32)
-
-    row_idx = bid
-    a_col_idx = offsets + hidden_size
-    b_col_idx = offsets
-
-    a_tile = ct.gather(input, (row_idx, a_col_idx), check_bounds=True)
-    b_tile = ct.gather(input, (row_idx, b_col_idx), check_bounds=True)
-    a_tile = ct.astype(a_tile, torch.float32)
-    b_tile = ct.astype(b_tile, torch.float32)
-
-    denom = ct.add(1, ct.exp(-a_tile), flush_to_zero=True)
-    sigmoid_a = ct.truediv(1.0, denom, flush_to_zero=True, rounding_mode=RMd.APPROX)
-    silu_a = ct.mul(a_tile, sigmoid_a, flush_to_zero=True)
-    result = ct.mul(silu_a, b_tile, flush_to_zero=True)
-    result = ct.astype(result, output.dtype)
-
-    out_col_idx = offsets
-    ct.scatter(output, (row_idx, out_col_idx), result, check_bounds=True)
-
-
-def cutile_silu_and_mul(input: torch.Tensor) -> torch.Tensor:
-    """CuTile fused SiLU and Mul: silu(input[:, hidden:]) * input[:, :hidden]"""
-    batch_size, double_hidden = input.shape
-    hidden_size = double_hidden // 2
-    
-    if batch_size == 0:
-        return torch.empty((0, hidden_size), dtype=input.dtype, device=input.device)
-    
-    output = torch.empty((batch_size, hidden_size), dtype=input.dtype, device=input.device)
-    TILE_SIZE = next_power_of_2(hidden_size)
-    
-    ct.launch(
-        torch.cuda.current_stream(),
-        (batch_size,),
-        silu_and_mul_kernel_row_wise,
-        (input.contiguous(), output, TILE_SIZE, hidden_size),
-    )
-    return output
-
-
-# ============================================================================
-# CuTile Group GEMM Kernel with Autotuning (from TileGym group_gemm.py)
-# ============================================================================
-
-@ct.kernel
-def group_gemm_kernel(
-    As,
-    Bs,
-    Cs,
-    TILE_M: ConstInt,
-    TILE_N: ConstInt,
-    TILE_K: ConstInt,
-    num_sm: ConstInt,
-    transpose_b: ConstBool,
-):
-    """Persistent group GEMM kernel for batching multiple matrix multiplications."""
-    tile_idx = ct.bid(0)
-    last_problem_end = 0
-    group_size = len(As)
-    zero_pad = ct.PaddingMode.ZERO
-
-    for g in range(group_size):
-        Ai = As[g]
-        Bi = Bs[g]
-        Ci = Cs[g]
-
-        num_m_tiles = ct.num_tiles(Ai, 0, (TILE_M, TILE_K))
-        num_k_tiles = ct.num_tiles(Ai, 1, (TILE_M, TILE_K))
-        if transpose_b:
-            num_n_tiles = ct.num_tiles(Bi, 0, (TILE_N, TILE_K))
-        else:
-            num_n_tiles = ct.num_tiles(Bi, 1, (TILE_K, TILE_N))
-
-        num_tiles = num_m_tiles * num_n_tiles
-
-        while tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
-            tile_idx_in_gemm = tile_idx - last_problem_end
-            tile_m_idx = tile_idx_in_gemm // num_n_tiles
-            tile_n_idx = tile_idx_in_gemm % num_n_tiles
-
-            acc = ct.zeros((TILE_M, TILE_N), dtype=ct.float32)
-
-            for kk in range(num_k_tiles):
-                ta = ct.load(Ai, (tile_m_idx, kk), shape=(TILE_M, TILE_K), padding_mode=zero_pad)
-
-                if transpose_b:
-                    tb = ct.load(Bi, (tile_n_idx, kk), shape=(TILE_N, TILE_K), padding_mode=zero_pad)
-                    tb = ct.transpose(tb)
-                else:
-                    tb = ct.load(Bi, (kk, tile_n_idx), shape=(TILE_K, TILE_N), padding_mode=zero_pad)
-
-                ta = ct.astype(ta, ct.tfloat32)
-                tb = ct.astype(tb, ct.tfloat32)
-                acc = ct.mma(ta, tb, acc)
-
-            acc = ct.astype(acc, Ci.dtype)
-            ct.store(Ci, (tile_m_idx, tile_n_idx), tile=acc)
-
-            tile_idx += num_sm
-
-        last_problem_end = last_problem_end + num_tiles
-
-
-def _group_gemm_autotune_configs():
-    """Autotune configurations for group GEMM kernel."""
-    gpu_capability = torch.cuda.get_device_capability()
-    if gpu_capability in [(12, 0), (12, 1)]:
-        yield SimpleNamespace(TILE_M=64, TILE_N=128, TILE_K=128, num_ctas=1, occupancy=1)
-        yield SimpleNamespace(TILE_M=128, TILE_N=128, TILE_K=128, num_ctas=1, occupancy=1)
-        yield SimpleNamespace(TILE_M=128, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=1)
-        yield SimpleNamespace(TILE_M=64, TILE_N=64, TILE_K=64, num_ctas=1, occupancy=2)
-    else:
-        yield SimpleNamespace(TILE_M=256, TILE_N=256, TILE_K=64, num_ctas=2, occupancy=1)
-        yield SimpleNamespace(TILE_M=128, TILE_N=256, TILE_K=64, num_ctas=2, occupancy=1)
-        yield SimpleNamespace(TILE_M=128, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=1)
-        yield SimpleNamespace(TILE_M=64, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=2)
-
-
-def cutile_group_gemm(group_A: List[torch.Tensor], group_B: List[torch.Tensor], transpose_b=True) -> List[torch.Tensor]:
-    """CuTile autotuned group GEMM for batching multiple matrix multiplications."""
-    if not group_A or not group_B:
-        return []
-    
-    device = group_A[0].device
-    dtype = group_A[0].dtype
-    
-    # Create output tensors
-    group_C = []
-    for A, B in zip(group_A, group_B):
-        M, K = A.shape
-        N = B.shape[0] if transpose_b else B.shape[1]
-        C = torch.empty((M, N), device=device, dtype=dtype)
-        group_C.append(C)
-    
-    NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
-    stream = torch.cuda.current_stream()
-    
-    # Prepare contiguous inputs
-    group_A_cont = [a.contiguous() for a in group_A]
-    group_B_cont = [b.contiguous() for b in group_B]
-    
-    autotune_launch(
-        stream,
-        grid_fn=lambda cfg: (NUM_SMS // cfg.num_ctas * cfg.occupancy, 1, 1),
-        kernel=group_gemm_kernel,
-        args_fn=lambda cfg: (
-            group_A_cont,
-            group_B_cont,
-            group_C,
-            cfg.TILE_M, cfg.TILE_N, cfg.TILE_K,
-            NUM_SMS // cfg.num_ctas * cfg.occupancy,
-            transpose_b,
-        ),
-        hints_fn=lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
-        search_space=_group_gemm_autotune_configs,
-    )
-    return group_C
-
-
-# ============================================================================
-# Threshold Configuration
-# ============================================================================
-
-GROUP_GEMM_MIN_EXPERTS = 4
-
-
-# ============================================================================
-# Main Entry Point
+# Main Entry Point - OPTIMIZED FOR SMALL SEQUENCE LENGTHS
 # ============================================================================
 
 @torch.no_grad()
@@ -544,11 +474,10 @@ def run(
     output: torch.Tensor,
 ):
     """
-    MoE kernel v3 - CuTile Optimization with Autotuning:
-    1. Vectorized token sorting
-    2. CuTile silu_and_mul kernel (optimized activation)
-    3. Autotuned Group GEMM for batching multiple expert GEMMs
-    4. cuBLAS for individual expert GEMMs when few experts active
+    MoE kernel OPTIMIZED FOR SMALL SEQUENCE LENGTHS (1-100 tokens):
+    1. Always uses CuTile GEMM (no cuBLAS fallback)
+    2. Smaller tile sizes for better occupancy
+    3. Batched SwiGLU for reduced kernel launch overhead
     """
     H = 7168
     I = 2048
@@ -572,46 +501,47 @@ def run(
         topk_idx, weights, E_local, local_expert_offset, E_global
     )
 
-    # Step 4: Expert Computation
+    # Step 4: Expert Computation - ALL CuTile for small batches
     result = torch.zeros((T, H), dtype=torch.float32, device=device)
 
     if total_count > 0:
         expert_counts = expert_offsets[1:] - expert_offsets[:-1]
         active_experts = (expert_counts > 0).nonzero(as_tuple=True)[0]
-        num_active = len(active_experts)
         
-        if num_active > 0:
-            expert_token_info = []
-            for le in active_experts.tolist():
-                start = expert_offsets[le].item()
-                end = expert_offsets[le + 1].item()
-                token_idx = sorted_token_ids[start:end]
-                expert_token_info.append((start, end, le, token_idx))
+        # Phase 1: GEMM1 for all experts using CuTile
+        G1_list = []
+        expert_info = []
+        
+        for le in active_experts.tolist():
+            start = expert_offsets[le].item()
+            end = expert_offsets[le + 1].item()
             
-            if num_active >= GROUP_GEMM_MIN_EXPERTS:
-                group_A = [A[info[3]] for info in expert_token_info]
-                group_W13 = [W13[info[2]] for info in expert_token_info]
-                group_W2 = [W2[info[2]] for info in expert_token_info]
+            token_idx = sorted_token_ids[start:end]
+            w_tok = sorted_weights[start:end]
+            A_e = A[token_idx]
+            W13_e = W13[le]
+            
+            # Always use CuTile GEMM for small batches
+            G1 = cutile_small_gemm(A_e, W13_e)
+            G1_list.append(G1)
+            expert_info.append((le, token_idx, w_tok, G1.shape[0]))
+        
+        # Phase 2: Batched SwiGLU (single kernel call for all tokens)
+        if G1_list:
+            G1_cat = torch.cat(G1_list, dim=0)
+            C_cat = cutile_swiglu(G1_cat, I)
+            
+            # Phase 3: GEMM2 for all experts using CuTile
+            offset = 0
+            for le, token_idx, w_tok, size in expert_info:
+                C = C_cat[offset:offset + size]
+                offset += size
                 
-                gemm1_outputs = cutile_group_gemm(group_A, group_W13, transpose_b=True)
-                swiglu_outputs = [cutile_silu_and_mul(G1) for G1 in gemm1_outputs]
-                gemm2_outputs = cutile_group_gemm(swiglu_outputs, group_W2, transpose_b=True)
+                W2_e = W2[le]
+                # Always use CuTile GEMM for small batches
+                O = cutile_small_gemm(C, W2_e)
                 
-                for i, (start, end, le, token_idx) in enumerate(expert_token_info):
-                    w_tok = sorted_weights[start:end]
-                    result.index_add_(0, token_idx, gemm2_outputs[i] * w_tok.unsqueeze(1))
-            else:
-                for start, end, le, token_idx in expert_token_info:
-                    A_e = A[token_idx]
-                    W13_e = W13[le]
-                    W2_e = W2[le]
-                    
-                    G1 = torch.mm(A_e, W13_e.t())
-                    C = cutile_silu_and_mul(G1)
-                    O = torch.mm(C, W2_e.t())
-                    
-                    w_tok = sorted_weights[start:end]
-                    result.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
+                result.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
 
-    # Step 5: Write output
+    # Step 5: Write output (DPS)
     output.copy_(result.to(torch.bfloat16))
