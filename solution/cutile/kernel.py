@@ -559,36 +559,47 @@ def group_gemm_kernel(
         last_problem_end = last_problem_end + num_tiles
 
 
-def _group_gemm_autotune_configs():
-    """Autotune configurations for group GEMM kernel."""
-    gpu_capability = torch.cuda.get_device_capability()
-    if gpu_capability in [(12, 0), (12, 1)]:
-        yield SimpleNamespace(TILE_M=64, TILE_N=128, TILE_K=128, num_ctas=1, occupancy=1)
-        yield SimpleNamespace(TILE_M=128, TILE_N=128, TILE_K=128, num_ctas=1, occupancy=1)
-        yield SimpleNamespace(TILE_M=128, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=1)
-        yield SimpleNamespace(TILE_M=64, TILE_N=64, TILE_K=64, num_ctas=1, occupancy=2)
-    else:
-        yield SimpleNamespace(TILE_M=256, TILE_N=256, TILE_K=64, num_ctas=2, occupancy=1)
-        yield SimpleNamespace(TILE_M=128, TILE_N=256, TILE_K=64, num_ctas=2, occupancy=1)
-        yield SimpleNamespace(TILE_M=128, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=1)
-        yield SimpleNamespace(TILE_M=64, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=2)
+# ============================================================================
+# Heuristic-Based Config Selection (replaces autotuner for FlashInfer-Bench compatibility)
+# These configs were determined by autotuning on NVIDIA B200 (Blackwell)
+# ============================================================================
+
+# Optimal configs from benchmarking on NVIDIA B200 (Blackwell):
+# - Small workloads (avg M < 100): TILE_M=64, TILE_N=128, TILE_K=64, occupancy=2
+# - Large workloads (avg M >= 100): TILE_M=128, TILE_N=128, TILE_K=64, occupancy=1
+# Note: 256x256 tiles are MUCH slower on Blackwell (42ms vs 1.7ms for 128x128)
+LARGE_WORKLOAD_THRESHOLD = 100
+
+# Pre-defined optimal configurations for Blackwell
+_SMALL_CONFIG = SimpleNamespace(TILE_M=64, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=2)
+_LARGE_CONFIG = SimpleNamespace(TILE_M=128, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=1)
 
 
 def cutile_group_gemm(group_A: List[torch.Tensor], group_B: List[torch.Tensor], transpose_b=True) -> List[torch.Tensor]:
-    """CuTile autotuned group GEMM for batching multiple matrix multiplications."""
+    """CuTile group GEMM with heuristic-based config selection.
+    
+    Uses optimal tile configurations determined by offline autotuning.
+    Selects config based on workload size for best performance.
+    """
     if not group_A or not group_B:
         return []
     
     device = group_A[0].device
     dtype = group_A[0].dtype
     
-    # Create output tensors
+    # Create output tensors and calculate total M
     group_C = []
+    total_m = 0
     for A, B in zip(group_A, group_B):
         M, K = A.shape
         N = B.shape[0] if transpose_b else B.shape[1]
         C = torch.empty((M, N), device=device, dtype=dtype)
         group_C.append(C)
+        total_m += M
+    
+    # Select config based on average M dimension
+    avg_m = total_m / len(group_A)
+    cfg = _LARGE_CONFIG if avg_m >= LARGE_WORKLOAD_THRESHOLD else _SMALL_CONFIG
     
     NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
     stream = torch.cuda.current_stream()
@@ -597,20 +608,16 @@ def cutile_group_gemm(group_A: List[torch.Tensor], group_B: List[torch.Tensor], 
     group_A_cont = [a.contiguous() for a in group_A]
     group_B_cont = [b.contiguous() for b in group_B]
     
-    autotune_launch(
+    # Direct launch with selected config (no autotuning overhead)
+    grid = (NUM_SMS // cfg.num_ctas * cfg.occupancy, 1, 1)
+    num_sm = NUM_SMS // cfg.num_ctas * cfg.occupancy
+    
+    ct.launch(
         stream,
-        grid_fn=lambda cfg: (NUM_SMS // cfg.num_ctas * cfg.occupancy, 1, 1),
-        kernel=group_gemm_kernel,
-        args_fn=lambda cfg: (
-            group_A_cont,
-            group_B_cont,
-            group_C,
-            cfg.TILE_M, cfg.TILE_N, cfg.TILE_K,
-            NUM_SMS // cfg.num_ctas * cfg.occupancy,
-            transpose_b,
-        ),
-        hints_fn=lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
-        search_space=_group_gemm_autotune_configs,
+        grid,
+        group_gemm_kernel,
+        (group_A_cont, group_B_cont, group_C, 
+         cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, num_sm, transpose_b),
     )
     return group_C
 

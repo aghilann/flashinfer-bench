@@ -3,9 +3,10 @@
 Quick test script to compare CuTile vs PyTorch MoE implementations.
 
 Usage:
-    python test_cutile.py                    # Run correctness test
-    python test_cutile.py --benchmark        # Run benchmark
-    python test_cutile.py --benchmark --iterations 100
+    python test_cutile.py hardcoded.py                      # Run correctness test
+    python test_cutile.py hardcoded.py --benchmark          # Run benchmark
+    python test_cutile.py hardcoded.py --benchmark --vary-seq-len
+    python test_cutile.py smallkernel.py --benchmark --iterations 100
 """
 
 import argparse
@@ -257,10 +258,10 @@ def benchmark(
     return avg_ms
 
 
-def run_benchmark(seq_len: int = 16, iterations: int = 50, usesmall: bool = False):
+def run_benchmark(seq_len: int = 16, iterations: int = 50, kernel: str = "hardcoded.py"):
     """Run benchmark comparing CuTile vs PyTorch."""
     
-    kernel_name = "smallkernel.py" if usesmall else "kernel.py"
+    kernel_name = kernel
     
     print(f"\n{'='*70}")
     print(f"Benchmark: CuTile vs PyTorch MoE Kernel ({kernel_name})")
@@ -280,10 +281,7 @@ def run_benchmark(seq_len: int = 16, iterations: int = 50, usesmall: bool = Fals
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(os.path.dirname(script_dir))
     
-    if usesmall:
-        cutile_kernel_path = os.path.join(repo_root, 'solution', 'cutile', 'smallkernel.py')
-    else:
-        cutile_kernel_path = os.path.join(repo_root, 'solution', 'cutile', 'hardcoded.py')
+    cutile_kernel_path = os.path.join(repo_root, 'solution', 'cutile', kernel_name)
     torch_kernel_path = os.path.join(repo_root, 'solution', 'torch', 'kernel.py')
     
     def load_kernel(kernel_path, module_name):
@@ -338,13 +336,13 @@ def run_benchmark(seq_len: int = 16, iterations: int = 50, usesmall: bool = Fals
 
 def main():
     parser = argparse.ArgumentParser(description="Test CuTile MoE kernel")
+    parser.add_argument("kernel", type=str, help="Kernel filename (e.g., hardcoded.py, smallkernel.py)")
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark")
     parser.add_argument("--seq-len", type=int, default=16, help="Sequence length (number of tokens)")
     parser.add_argument("--tokens", type=int, default=None, help="Alias for --seq-len")
     parser.add_argument("--iterations", type=int, default=50, help="Benchmark iterations")
     parser.add_argument("--skip-correctness", action="store_true", help="Skip correctness check")
     parser.add_argument("--vary-seq-len", action="store_true", help="Test multiple seq_len values")
-    parser.add_argument("--usesmall", action="store_true", help="Use smallkernel.py optimized for small sequences")
     args = parser.parse_args()
     
     # Handle --tokens as alias for --seq-len
@@ -356,10 +354,7 @@ def main():
     
     print(f"Device: {torch.cuda.get_device_name()}")
     print(f"CUDA: {torch.version.cuda}")
-    if args.usesmall:
-        print("Using: smallkernel.py (optimized for small sequences)")
-    else:
-        print("Using: kernel.py")
+    print(f"Using: {args.kernel}")
     
     # Setup paths - works whether run from repo root or solution/cutile/
     import sys
@@ -386,11 +381,8 @@ def main():
         spec.loader.exec_module(module)
         return module
     
-    # Choose kernel file based on --usesmall flag
-    if args.usesmall:
-        cutile_kernel_path = os.path.join(cutile_dir, 'smallkernel.py')
-    else:
-        cutile_kernel_path = os.path.join(cutile_dir, 'hardcoded.py')
+    # Choose kernel file based on kernel argument
+    cutile_kernel_path = os.path.join(cutile_dir, args.kernel)
     torch_kernel_path = os.path.join(torch_dir, 'kernel.py')
     
     # Run correctness check
@@ -427,12 +419,12 @@ def main():
             # Test multiple seq_len values
             for sl in [1, 4, 16, 64, 256, 1024, 2048, 4096, 8192, 16384]:
                 try:
-                    run_benchmark(seq_len=sl, iterations=args.iterations, usesmall=args.usesmall)
+                    run_benchmark(seq_len=sl, iterations=args.iterations, kernel=args.kernel)
                 except torch.cuda.OutOfMemoryError:
                     print(f"OOM at seq_len={sl}, stopping")
                     break
         else:
-            run_benchmark(seq_len=seq_len, iterations=args.iterations, usesmall=args.usesmall)
+            run_benchmark(seq_len=seq_len, iterations=args.iterations, kernel=args.kernel)
 
 
 if __name__ == "__main__":

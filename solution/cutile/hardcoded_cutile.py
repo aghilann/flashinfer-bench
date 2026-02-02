@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 """
-MoE Kernel - Simplified CuTile with Hardcoded Optimal Tile Sizes.
-Streamlined version maintaining Triton dequant for performance.
+MoE Kernel - Pure CuTile Implementation (no Triton).
+Replaces Triton dequant kernels with CuTile equivalents.
 """
 
 BLOCK = 128
@@ -14,8 +14,6 @@ GROUP_GEMM_MIN_EXPERTS = 4
 
 import cuda.tile as ct
 import torch
-import triton
-import triton.language as tl
 from typing import Tuple, List
 from cuda.tile._numeric_semantics import RoundingMode as RMd
 
@@ -28,56 +26,80 @@ def next_power_of_2(n):
 
 
 # ============================================================================
-# FP8 Dequantization - Triton Kernels (essential for performance)
+# FP8 Dequantization - CuTile Kernels
 # ============================================================================
 
-@triton.jit
-def _dequant_hidden_kernel(data_ptr, scales_ptr, output_ptr, T, H,
-                           stride_data_t, stride_data_h, stride_scales_b, stride_scales_t,
-                           stride_out_t, stride_out_h, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    for col_start in range(0, H, BLOCK_SIZE):
-        col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < H
-        data_vals = tl.load(data_ptr + row_idx * stride_data_t + col_offsets * stride_data_h, mask=mask).to(tl.float32)
-        scale_vals = tl.load(scales_ptr + (col_offsets // 128) * stride_scales_b + row_idx * stride_scales_t, mask=mask)
-        tl.store(output_ptr + row_idx * stride_out_t + col_offsets * stride_out_h, data_vals * scale_vals, mask=mask)
+@ct.kernel
+def dequant_hidden_kernel(data, scales, output, TILE_H: ConstInt, H: ConstInt):
+    """CuTile FP8 dequantization for hidden states.
+    data: [T, H] FP8, scales: [num_blocks, T], output: [T, H] float32
+    """
+    row_idx = ct.bid(0)
+    col_offsets = ct.arange(TILE_H, dtype=torch.int32)
+    
+    # Load FP8 data and convert to float32
+    data_tile = ct.gather(data, (row_idx, col_offsets), check_bounds=True)
+    data_f32 = ct.astype(data_tile, torch.float32)
+    
+    # Compute block indices: col_offsets // 128
+    block_indices = col_offsets // 128
+    
+    # Gather scales: scales[block_idx, row_idx]
+    scale_vals = ct.gather(scales, (block_indices, row_idx), check_bounds=True)
+    
+    # Multiply and store
+    result = ct.mul(data_f32, scale_vals, flush_to_zero=True)
+    ct.scatter(output, (row_idx, col_offsets), result, check_bounds=True)
 
 
 def dequantize_hidden_states(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     T, H = data.shape
     if T == 0:
         return torch.empty((0, H), dtype=torch.float32, device=data.device)
+    
     output = torch.empty((T, H), dtype=torch.float32, device=data.device)
-    _dequant_hidden_kernel[(T,)](data, scales, output, T, H,
-                                  data.stride(0), data.stride(1), scales.stride(0), scales.stride(1),
-                                  output.stride(0), output.stride(1), BLOCK_SIZE=1024)
+    TILE_H = next_power_of_2(H)
+    
+    ct.launch(torch.cuda.current_stream(), (T,), dequant_hidden_kernel,
+              (data.contiguous(), scales.contiguous(), output, TILE_H, H))
     return output
 
 
-@triton.jit
-def _dequant_weights_kernel(data_ptr, scales_ptr, output_ptr, out_dim, in_dim,
-                            stride_data_o, stride_data_i, stride_scales_ob, stride_scales_ib,
-                            stride_out_o, stride_out_i, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    for col_start in range(0, in_dim, BLOCK_SIZE):
-        col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < in_dim
-        data_vals = tl.load(data_ptr + row_idx * stride_data_o + col_offsets * stride_data_i, mask=mask).to(tl.float32)
-        scale_vals = tl.load(scales_ptr + (row_idx // 128) * stride_scales_ob + (col_offsets // 128) * stride_scales_ib, mask=mask)
-        tl.store(output_ptr + row_idx * stride_out_o + col_offsets * stride_out_i, data_vals * scale_vals, mask=mask)
+@ct.kernel
+def dequant_weights_kernel(data, scales, output, TILE_K: ConstInt, in_dim: ConstInt):
+    """CuTile FP8 dequantization for weight matrix.
+    data: [out_dim, in_dim] FP8, scales: [num_out_blocks, num_in_blocks], output: [out_dim, in_dim] float32
+    """
+    row_idx = ct.bid(0)
+    col_offsets = ct.arange(TILE_K, dtype=torch.int32)
+    
+    # Load FP8 data and convert to float32
+    data_tile = ct.gather(data, (row_idx, col_offsets), check_bounds=True)
+    data_f32 = ct.astype(data_tile, torch.float32)
+    
+    # Compute block indices
+    row_block = row_idx // 128
+    col_blocks = col_offsets // 128
+    
+    # Gather scales: scales[row_block, col_block]
+    scale_vals = ct.gather(scales, (row_block, col_blocks), check_bounds=True)
+    
+    # Multiply and store
+    result = ct.mul(data_f32, scale_vals, flush_to_zero=True)
+    ct.scatter(output, (row_idx, col_offsets), result, check_bounds=True)
 
 
 def dequantize_weights_batched(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     E_local, out_dim, in_dim = data.shape
     if E_local == 0:
         return torch.empty((0, out_dim, in_dim), dtype=torch.float32, device=data.device)
+    
     output = torch.empty((E_local, out_dim, in_dim), dtype=torch.float32, device=data.device)
+    TILE_K = next_power_of_2(in_dim)
+    
     for e in range(E_local):
-        _dequant_weights_kernel[(out_dim,)](data[e], scales[e], output[e], out_dim, in_dim,
-                                            data[e].stride(0), data[e].stride(1),
-                                            scales[e].stride(0), scales[e].stride(1),
-                                            output[e].stride(0), output[e].stride(1), BLOCK_SIZE=1024)
+        ct.launch(torch.cuda.current_stream(), (out_dim,), dequant_weights_kernel,
+                  (data[e].contiguous(), scales[e].contiguous(), output[e], TILE_K, in_dim))
     return output
 
 
@@ -113,7 +135,6 @@ def deepseek_routing(routing_logits: torch.Tensor, routing_bias: torch.Tensor,
 # ============================================================================
 # Token Sorting
 # ============================================================================
-
 def sort_tokens_by_expert(topk_idx: torch.Tensor, weights: torch.Tensor,
                           E_local: int, local_expert_offset: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     device = topk_idx.device
@@ -240,7 +261,7 @@ def run(routing_logits: torch.Tensor, routing_bias: torch.Tensor,
     E_local, T, H = gemm1_weights.shape[0], routing_logits.shape[0], 7168
     device = hidden_states.device
 
-    # Dequantize
+    # Dequantize (using CuTile kernels)
     A = dequantize_hidden_states(hidden_states, hidden_states_scale)
     W13 = dequantize_weights_batched(gemm1_weights, gemm1_weights_scale)
     W2 = dequantize_weights_batched(gemm2_weights, gemm2_weights_scale)
