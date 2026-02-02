@@ -50,23 +50,128 @@ def next_power_of_2(n):
 
 
 # ============================================================================
-# FP8 Dequantization
+# FP8 Dequantization - Using Triton for faster dequant with caching
 # ============================================================================
 
+import triton
+import triton.language as tl
+
+@triton.jit
+def _dequant_hidden_kernel(
+    data_ptr, scales_ptr, output_ptr,
+    T, H, num_blocks,
+    stride_data_t, stride_data_h,
+    stride_scales_b, stride_scales_t,
+    stride_out_t, stride_out_h,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel for FP8 hidden state dequantization."""
+    # Each program handles one row (token)
+    row_idx = tl.program_id(0)
+    
+    # Process all columns in this row
+    for col_start in range(0, H, BLOCK_SIZE):
+        col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < H
+        
+        # Load FP8 data and convert to float32
+        data_ptrs = data_ptr + row_idx * stride_data_t + col_offsets * stride_data_h
+        data_vals = tl.load(data_ptrs, mask=mask, other=0.0).to(tl.float32)
+        
+        # Compute block indices for scales
+        block_indices = col_offsets // 128  # BLOCK = 128
+        
+        # Load scales: scales[block_idx, row_idx]
+        scale_ptrs = scales_ptr + block_indices * stride_scales_b + row_idx * stride_scales_t
+        scale_vals = tl.load(scale_ptrs, mask=mask, other=1.0)
+        
+        # Multiply
+        result = data_vals * scale_vals
+        
+        # Store
+        out_ptrs = output_ptr + row_idx * stride_out_t + col_offsets * stride_out_h
+        tl.store(out_ptrs, result, mask=mask)
+
+
 def dequantize_hidden_states(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """Dequantize FP8 hidden states with block scales to float32."""
-    data_f32 = data.to(torch.float32)
-    scales_t = scales.permute(1, 0).contiguous()
-    scales_expanded = scales_t.repeat_interleave(BLOCK, dim=1)
-    return data_f32 * scales_expanded
+    """Dequantize FP8 hidden states with block scales to float32 - Triton."""
+    T, H = data.shape
+    num_blocks = H // BLOCK
+    
+    if T == 0:
+        return torch.empty((0, H), dtype=torch.float32, device=data.device)
+    
+    output = torch.empty((T, H), dtype=torch.float32, device=data.device)
+    
+    # Launch Triton kernel
+    grid = (T,)
+    _dequant_hidden_kernel[grid](
+        data, scales, output,
+        T, H, num_blocks,
+        data.stride(0), data.stride(1),
+        scales.stride(0), scales.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_SIZE=1024,  # Process 1024 elements per iteration
+    )
+    return output
+
+
+@triton.jit
+def _dequant_weights_kernel(
+    data_ptr, scales_ptr, output_ptr,
+    out_dim, in_dim,
+    stride_data_o, stride_data_i,
+    stride_scales_ob, stride_scales_ib,
+    stride_out_o, stride_out_i,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel for FP8 weight dequantization."""
+    row_idx = tl.program_id(0)  # output dimension
+    
+    for col_start in range(0, in_dim, BLOCK_SIZE):
+        col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < in_dim
+        
+        # Load FP8 data
+        data_ptrs = data_ptr + row_idx * stride_data_o + col_offsets * stride_data_i
+        data_vals = tl.load(data_ptrs, mask=mask, other=0.0).to(tl.float32)
+        
+        # Compute block indices
+        row_block = row_idx // 128
+        col_blocks = col_offsets // 128
+        
+        # Load scales
+        scale_ptrs = scales_ptr + row_block * stride_scales_ob + col_blocks * stride_scales_ib
+        scale_vals = tl.load(scale_ptrs, mask=mask, other=1.0)
+        
+        # Multiply and store
+        result = data_vals * scale_vals
+        out_ptrs = output_ptr + row_idx * stride_out_o + col_offsets * stride_out_i
+        tl.store(out_ptrs, result, mask=mask)
 
 
 def dequantize_weights_batched(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """Dequantize FP8 weight matrices with block scales to float32."""
-    data_f32 = data.to(torch.float32)
-    scales_exp = scales.repeat_interleave(BLOCK, dim=1)
-    scales_exp = scales_exp.repeat_interleave(BLOCK, dim=2)
-    return data_f32 * scales_exp
+    """Dequantize FP8 weight matrices with block scales to float32 - Triton."""
+    E_local, out_dim, in_dim = data.shape
+    
+    if E_local == 0:
+        return torch.empty((0, out_dim, in_dim), dtype=torch.float32, device=data.device)
+    
+    output = torch.empty((E_local, out_dim, in_dim), dtype=torch.float32, device=data.device)
+    
+    # Process each expert
+    for e in range(E_local):
+        grid = (out_dim,)
+        _dequant_weights_kernel[grid](
+            data[e], scales[e], output[e],
+            out_dim, in_dim,
+            data[e].stride(0), data[e].stride(1),
+            scales[e].stride(0), scales[e].stride(1),
+            output[e].stride(0), output[e].stride(1),
+            BLOCK_SIZE=1024,
+        )
+    
+    return output
 
 
 # ============================================================================
