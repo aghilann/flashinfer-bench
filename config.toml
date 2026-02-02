@@ -19,5 +19,5 @@ source_dir = "cutile"             # cutile | torch | triton | cuda
 #
 # [build]
 # language = "python"
-# entry_point = "kernel.py::run"
+# entry_point = "hardcoded.py::run"
 # source_dir = "torch"

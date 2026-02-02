@@ -4,9 +4,9 @@
 """
 MoE Kernel for FlashInfer Competition - DeepSeek-V3 MoE Layer.
 
-VERSION: v3-noautotune - CuTile Optimization WITHOUT Autotuning:
+VERSION: v3 - CuTile Optimization with Autotuning:
 1. Optimized silu_and_mul kernel from TileGym
-2. Group GEMM with fixed tile configuration (no autotuning)
+2. Autotuned Group GEMM for batching expert matrix multiplications
 3. Vectorized token sorting
 """
 
@@ -20,8 +20,213 @@ TOPK_GROUP = 4
 
 import cuda.tile as ct
 import torch
-from typing import Tuple, List
+import random
+import functools
+import threading
+import logging
+from contextlib import contextmanager
+from math import ceil
+from types import SimpleNamespace
+from typing import Tuple, List, Any, Iterable, Callable, Sequence
 from cuda.tile._numeric_semantics import RoundingMode as RMd
+from cuda.tile._exception import TileCompilerTimeoutError, TileCompilerExecutionError
+from cuda.tile._cext import default_tile_context
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Autotuner (from cuda.tile_experimental)
+# ============================================================================
+
+_MAX_SEARCH_ITEMS = 10_000
+_autotune_lock = threading.RLock()
+
+
+def _with_autotune_lock(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with _autotune_lock:
+            return func(*args, **kwargs)
+    return wrapper
+
+
+def _shape_dtype_stride(arg: Any):
+    shape = tuple(arg.shape)
+    dtype = arg.dtype
+    stride = None
+    if hasattr(arg, "stride"):
+        s = arg.stride() if callable(arg.stride) else arg.stride
+        stride = tuple(int(x) for x in s)
+    elif hasattr(arg, "strides"):
+        itemsize = getattr(arg, "itemsize", 1)
+        stride = tuple(int(b // itemsize) for b in arg.strides)
+    return shape, dtype, stride
+
+
+def _default_key(args):
+    tinfo = []
+    for arg in args:
+        if hasattr(arg, "shape") and hasattr(arg, "dtype"):
+            shape, dtype, stride = _shape_dtype_stride(arg)
+            tinfo.append((shape, dtype, stride))
+        else:
+            tinfo.append(type(arg).__name__)
+    return tuple(tinfo)
+
+
+def _time_ms(run_once, *, get_args, stream, warmup=2, rep=10):
+    stream.synchronize()
+    for _ in range(warmup):
+        run_once(get_args())
+    args_per_run = [get_args() for _ in range(rep)]
+    stream.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record(stream)
+    for i in range(rep):
+        run_once(args_per_run[i])
+    end.record(stream)
+    end.synchronize()
+    ms = start.elapsed_time(end)
+    return ms / max(1, rep)
+
+
+class TunedResult:
+    def __init__(self, tuned_config, grid, kernel, tuning_record, cache_hit):
+        self.tuned_config = tuned_config
+        self.grid = grid
+        self.kernel = kernel
+        self.tuning_record = tuning_record
+        self.cache_hit = cache_hit
+
+
+class _CacheEntry:
+    def __init__(self, best_cfg, best_grid, best_kernel, tuning_record):
+        self.best_cfg = best_cfg
+        self.best_grid = best_grid
+        self.best_kernel = best_kernel
+        self.tuning_record = tuning_record
+
+
+@contextmanager
+def compiler_timeout(timeout_sec: int):
+    old_timeout = default_tile_context.config.compiler_timeout_sec
+    default_tile_context.config.compiler_timeout_sec = timeout_sec
+    try:
+        yield
+    finally:
+        default_tile_context.config.compiler_timeout_sec = old_timeout
+
+
+def _reservoir_sample(iterable: Iterable[Any], k: int, *, rng: random.Random, max_items: int) -> list[Any]:
+    reservoir: list[Any] = []
+    n_seen = 0
+    for item in iterable:
+        n_seen += 1
+        if n_seen > max_items:
+            break
+        if len(reservoir) < k:
+            reservoir.append(item)
+        else:
+            j = rng.randint(0, n_seen - 1)
+            if j < k:
+                reservoir[j] = item
+    return reservoir
+
+
+def autotune_launch(stream, grid_fn, kernel,
+                    args_fn: Callable[[Any], tuple[Any, ...]],
+                    launch_args_fn: Callable[[Any], tuple[Any, ...]] | None = None,
+                    hints_fn: Callable[[Any], dict[str, Any]] | None = None,
+                    *,
+                    search_space: Iterable[Any] | Callable[[], Iterable[Any]],
+                    key: Any | None = None,
+                    max_iter: int = 60,
+                    compiler_time_limit_sec: int = 10,
+                    seed: int | None = None,
+                    force_retune: bool = False) -> TunedResult:
+    if callable(search_space):
+        search_space = search_space()
+
+    rng = random.Random(seed)
+    search_space = _reservoir_sample(search_space, k=max_iter, rng=rng, max_items=_MAX_SEARCH_ITEMS)
+    if len(search_space) == 0:
+        raise ValueError("Search space must contain at least 1 configuration")
+
+    with _autotune_lock:
+        autotune_cache = default_tile_context.autotune_cache
+        if autotune_cache is None:
+            autotune_cache = {}
+            default_tile_context.autotune_cache = autotune_cache
+
+        kernel_key = kernel._pyfunc
+        per_kernel = autotune_cache.get(kernel_key)
+        if per_kernel is None:
+            per_kernel = {}
+            autotune_cache[kernel_key] = per_kernel
+
+        if key is None:
+            arg_key = _default_key(args_fn(search_space[0]))
+        else:
+            arg_key = key
+
+        tuning_entries: list[tuple[Any, float]] = []
+        cache_hit = False
+
+        if not force_retune and arg_key in per_kernel:
+            cache_hit = True
+        else:
+            indices = list(range(len(search_space)))
+            rng.shuffle(indices)
+
+            best_time_ms, best_cfg, best_kernel = float("inf"), None, None
+            for i, cfg_idx in enumerate(indices):
+                cfg = search_space[cfg_idx]
+                grid = grid_fn(cfg)
+                hints = hints_fn(cfg) if hints_fn else {}
+                updated_kernel = ct.kernel(kernel._pyfunc, **hints)
+
+                def run_once(args):
+                    ct.launch(stream, grid, updated_kernel, args)
+
+                try:
+                    with compiler_timeout(compiler_time_limit_sec):
+                        time_ms = _time_ms(run_once, get_args=lambda: args_fn(cfg), stream=stream)
+                except TileCompilerTimeoutError:
+                    continue
+                except TileCompilerExecutionError:
+                    continue
+
+                if time_ms < best_time_ms:
+                    best_time_ms = time_ms
+                    best_cfg, best_grid, best_kernel = cfg, grid, updated_kernel
+                tuning_entries.append((cfg, time_ms))
+
+            if best_cfg is None:
+                raise ValueError("No valid config found")
+            per_kernel[arg_key] = _CacheEntry(best_cfg, best_grid, best_kernel, tuning_entries)
+
+        cache_entry = per_kernel[arg_key]
+
+    best_args = launch_args_fn(cache_entry.best_cfg) if launch_args_fn else args_fn(cache_entry.best_cfg)
+    ct.launch(stream, cache_entry.best_grid, cache_entry.best_kernel, best_args)
+
+    return TunedResult(
+        tuned_config=cache_entry.best_cfg,
+        grid=cache_entry.best_grid,
+        kernel=cache_entry.best_kernel,
+        tuning_record=cache_entry.tuning_record,
+        cache_hit=cache_hit
+    )
+
+
+# ============================================================================
+# Constants for DeepSeek-V3/R1 MoE
+# ============================================================================
+BLOCK = 128  # FP8 block scale block size
+TOP_K = 8
+N_GROUP = 8
+TOPK_GROUP = 4
 
 ConstInt = ct.Constant[int]
 ConstBool = ct.Constant[bool]
@@ -41,23 +246,113 @@ def next_power_of_2(n):
 
 
 # ============================================================================
-# FP8 Dequantization
+# FP8 Dequantization - Fused CuTile Kernels (optimized, no repeat_interleave)
 # ============================================================================
 
+@ct.kernel
+def dequant_hidden_kernel(
+    data,       # [T, H] FP8
+    scales,     # [num_blocks, T] float32
+    output,     # [T, H] float32
+    TILE_H: ConstInt,
+    H: ConstInt,
+):
+    """Fused FP8 dequantization for hidden states - compute scale index on-the-fly."""
+    row_idx = ct.bid(0)  # token index
+    col_offsets = ct.arange(TILE_H, dtype=torch.int32)
+    
+    # Load FP8 data for this row
+    data_tile = ct.gather(data, (row_idx, col_offsets), check_bounds=True)
+    data_f32 = ct.astype(data_tile, torch.float32)
+    
+    # Compute block indices: col_offsets // BLOCK -> which scale block
+    # scales is [num_blocks, T], we need scales[block_idx, row_idx]
+    block_indices = col_offsets // 128  # BLOCK = 128
+    
+    # Gather scales for each element based on its block
+    scale_vals = ct.gather(scales, (block_indices, row_idx), check_bounds=True)
+    
+    # Multiply
+    result = ct.mul(data_f32, scale_vals, flush_to_zero=True)
+    
+    ct.scatter(output, (row_idx, col_offsets), result, check_bounds=True)
+
+
 def dequantize_hidden_states(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """Dequantize FP8 hidden states with block scales to float32."""
-    data_f32 = data.to(torch.float32)
-    scales_t = scales.permute(1, 0).contiguous()
-    scales_expanded = scales_t.repeat_interleave(BLOCK, dim=1)
-    return data_f32 * scales_expanded
+    """Dequantize FP8 hidden states with block scales to float32 - FUSED."""
+    T, H = data.shape
+    
+    if T == 0:
+        return torch.empty((0, H), dtype=torch.float32, device=data.device)
+    
+    output = torch.empty((T, H), dtype=torch.float32, device=data.device)
+    TILE_H = next_power_of_2(H)
+    
+    # scales is [num_blocks, T], keep it as-is (no permute needed)
+    scales_cont = scales.contiguous()
+    
+    ct.launch(
+        torch.cuda.current_stream(),
+        (T,),  # one block per row/token
+        dequant_hidden_kernel,
+        (data.contiguous(), scales_cont, output, TILE_H, H),
+    )
+    return output
+
+
+@ct.kernel  
+def dequant_weights_kernel(
+    data,       # [out_dim, in_dim] FP8
+    scales,     # [num_out_blocks, num_in_blocks] float32
+    output,     # [out_dim, in_dim] float32
+    TILE_K: ConstInt,
+    in_dim: ConstInt,
+):
+    """Fused FP8 dequantization for weight matrix - compute scale indices on-the-fly."""
+    row_idx = ct.bid(0)  # output dimension index
+    col_offsets = ct.arange(TILE_K, dtype=torch.int32)
+    
+    # Load FP8 data for this row
+    data_tile = ct.gather(data, (row_idx, col_offsets), check_bounds=True)
+    data_f32 = ct.astype(data_tile, torch.float32)
+    
+    # Compute block indices
+    row_block = row_idx // 128  # which output block
+    col_blocks = col_offsets // 128  # which input block for each element
+    
+    # Gather scales: scales[row_block, col_block]
+    scale_vals = ct.gather(scales, (row_block, col_blocks), check_bounds=True)
+    
+    # Multiply
+    result = ct.mul(data_f32, scale_vals, flush_to_zero=True)
+    
+    ct.scatter(output, (row_idx, col_offsets), result, check_bounds=True)
 
 
 def dequantize_weights_batched(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """Dequantize FP8 weight matrices with block scales to float32."""
-    data_f32 = data.to(torch.float32)
-    scales_exp = scales.repeat_interleave(BLOCK, dim=1)
-    scales_exp = scales_exp.repeat_interleave(BLOCK, dim=2)
-    return data_f32 * scales_exp
+    """Dequantize FP8 weight matrices with block scales to float32 - FUSED."""
+    E_local, out_dim, in_dim = data.shape
+    
+    if E_local == 0:
+        return torch.empty((0, out_dim, in_dim), dtype=torch.float32, device=data.device)
+    
+    output = torch.empty((E_local, out_dim, in_dim), dtype=torch.float32, device=data.device)
+    TILE_K = next_power_of_2(in_dim)
+    
+    # Process each expert separately (could be batched further if needed)
+    for e in range(E_local):
+        data_e = data[e].contiguous()
+        scales_e = scales[e].contiguous()
+        output_e = output[e]
+        
+        ct.launch(
+            torch.cuda.current_stream(),
+            (out_dim,),  # one block per row
+            dequant_weights_kernel,
+            (data_e, scales_e, output_e, TILE_K, in_dim),
+        )
+    
+    return output
 
 
 # ============================================================================
@@ -202,7 +497,7 @@ def cutile_silu_and_mul(input: torch.Tensor) -> torch.Tensor:
 
 
 # ============================================================================
-# CuTile Group GEMM Kernel - Fixed Configuration (NO Autotuning)
+# CuTile Group GEMM Kernel with Autotuning (from TileGym group_gemm.py)
 # ============================================================================
 
 @ct.kernel
@@ -264,8 +559,23 @@ def group_gemm_kernel(
         last_problem_end = last_problem_end + num_tiles
 
 
+def _group_gemm_autotune_configs():
+    """Autotune configurations for group GEMM kernel."""
+    gpu_capability = torch.cuda.get_device_capability()
+    if gpu_capability in [(12, 0), (12, 1)]:
+        yield SimpleNamespace(TILE_M=64, TILE_N=128, TILE_K=128, num_ctas=1, occupancy=1)
+        yield SimpleNamespace(TILE_M=128, TILE_N=128, TILE_K=128, num_ctas=1, occupancy=1)
+        yield SimpleNamespace(TILE_M=128, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=1)
+        yield SimpleNamespace(TILE_M=64, TILE_N=64, TILE_K=64, num_ctas=1, occupancy=2)
+    else:
+        yield SimpleNamespace(TILE_M=256, TILE_N=256, TILE_K=64, num_ctas=2, occupancy=1)
+        yield SimpleNamespace(TILE_M=128, TILE_N=256, TILE_K=64, num_ctas=2, occupancy=1)
+        yield SimpleNamespace(TILE_M=128, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=1)
+        yield SimpleNamespace(TILE_M=64, TILE_N=128, TILE_K=64, num_ctas=1, occupancy=2)
+
+
 def cutile_group_gemm(group_A: List[torch.Tensor], group_B: List[torch.Tensor], transpose_b=True) -> List[torch.Tensor]:
-    """CuTile group GEMM with fixed tile configuration (no autotuning)."""
+    """CuTile autotuned group GEMM for batching multiple matrix multiplications."""
     if not group_A or not group_B:
         return []
     
@@ -287,26 +597,20 @@ def cutile_group_gemm(group_A: List[torch.Tensor], group_B: List[torch.Tensor], 
     group_A_cont = [a.contiguous() for a in group_A]
     group_B_cont = [b.contiguous() for b in group_B]
     
-    # Fixed tile configuration (no autotuning)
-    # Optimized for seq_len 16-64 (small M dimension per expert)
-    gpu_capability = torch.cuda.get_device_capability()
-    if gpu_capability in [(12, 0), (12, 1)]:
-        # Blackwell configuration - smaller TILE_M for better occupancy with small batches
-        TILE_M, TILE_N, TILE_K = 64, 128, 128
-        num_ctas, occupancy = 1, 1
-    else:
-        # Default configuration for other GPUs (Hopper, Ampere, etc.)
-        TILE_M, TILE_N, TILE_K = 64, 128, 64
-        num_ctas, occupancy = 1, 2
-    
-    grid = (NUM_SMS // num_ctas * occupancy, 1, 1)
-    num_sm = NUM_SMS // num_ctas * occupancy
-    
-    ct.launch(
+    autotune_launch(
         stream,
-        grid,
-        group_gemm_kernel,
-        (group_A_cont, group_B_cont, group_C, TILE_M, TILE_N, TILE_K, num_sm, transpose_b),
+        grid_fn=lambda cfg: (NUM_SMS // cfg.num_ctas * cfg.occupancy, 1, 1),
+        kernel=group_gemm_kernel,
+        args_fn=lambda cfg: (
+            group_A_cont,
+            group_B_cont,
+            group_C,
+            cfg.TILE_M, cfg.TILE_N, cfg.TILE_K,
+            NUM_SMS // cfg.num_ctas * cfg.occupancy,
+            transpose_b,
+        ),
+        hints_fn=lambda cfg: {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy},
+        search_space=_group_gemm_autotune_configs,
     )
     return group_C
 
@@ -337,10 +641,10 @@ def run(
     output: torch.Tensor,
 ):
     """
-    MoE kernel v3-noautotune - CuTile Optimization WITHOUT Autotuning:
+    MoE kernel v3 - CuTile Optimization with Autotuning:
     1. Vectorized token sorting
     2. CuTile silu_and_mul kernel (optimized activation)
-    3. Group GEMM with fixed tile configuration (no autotuning)
+    3. Autotuned Group GEMM for batching multiple expert GEMMs
     4. cuBLAS for individual expert GEMMs when few experts active
     """
     H = 7168
@@ -470,7 +774,7 @@ if __name__ == "__main__":
     output = torch.zeros(T, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
     
     print(f"Tensors created. GPU Memory: ~{torch.cuda.memory_allocated() / 1e9:.2f} GB")
-    print("Running kernel (no autotuning)...")
+    print("Running kernel...")
     
     run(
         routing_logits,

@@ -231,3 +231,6 @@ cd /workspace/flashinfer-bench-starter-kit && export FIB_DATASET_PATH=/workspace
 
 
 cd /workspace/flashinfer-bench-starter-kit && export FIB_DATASET_PATH=/workspace/flashinfer-bench-starter-kit/flashinfer-trace && .venv/bin/python scripts/run_quick.py
+
+
+uv run solution/cutile/test_cutile.py --benchmark --vary-seq-len --iterations 20 --skip-correctness
