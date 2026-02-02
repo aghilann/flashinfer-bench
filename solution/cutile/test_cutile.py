@@ -283,7 +283,7 @@ def run_benchmark(seq_len: int = 16, iterations: int = 50, usesmall: bool = Fals
     if usesmall:
         cutile_kernel_path = os.path.join(repo_root, 'solution', 'cutile', 'smallkernel.py')
     else:
-        cutile_kernel_path = os.path.join(repo_root, 'solution', 'cutile', 'kernel.py')
+        cutile_kernel_path = os.path.join(repo_root, 'solution', 'cutile', 'hardcoded.py')
     torch_kernel_path = os.path.join(repo_root, 'solution', 'torch', 'kernel.py')
     
     def load_kernel(kernel_path, module_name):
@@ -390,7 +390,7 @@ def main():
     if args.usesmall:
         cutile_kernel_path = os.path.join(cutile_dir, 'smallkernel.py')
     else:
-        cutile_kernel_path = os.path.join(cutile_dir, 'kernel.py')
+        cutile_kernel_path = os.path.join(cutile_dir, 'hardcoded.py')
     torch_kernel_path = os.path.join(torch_dir, 'kernel.py')
     
     # Run correctness check

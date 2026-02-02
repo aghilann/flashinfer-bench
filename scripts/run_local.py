@@ -6,6 +6,7 @@ Automatically packs the solution from source files and runs benchmarks locally.
 
 import os
 import sys
+
 from pathlib import Path
 
 # Add project root to path for imports
@@ -119,3 +120,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# cd /workspace/flashinfer-bench-starter-kit && export FIB_DATASET_PATH=/workspace/flashinfer-bench-starter-kit/flashinfer-trace && .venv/bin/python scripts/run_local.py

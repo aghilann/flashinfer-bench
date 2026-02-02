@@ -5,7 +5,7 @@ author = "aghilan"              # Team/author name
 
 [build]
 language = "python"               # python | triton | cuda
-entry_point = "kernel.py::run"    # file_path::function_name
+entry_point = "hardcoded.py::run" # file_path::function_name
 source_dir = "cutile"             # cutile | torch | triton | cuda
 
 # ========================================
